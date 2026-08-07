@@ -1,0 +1,16 @@
+# Secrets and config
+.env
+.env.*
+!.env.example
+
+# Runtime data (conversation memory, caches, downloaded models)
+data/
+.cache/
+models/
+
+# Dependencies
+node_modules/
+
+# Logs and OS junk
+*.log
+.DS_Store
