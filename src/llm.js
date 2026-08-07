@@ -101,6 +101,21 @@ export function isRepeat(a, b) {
   return overlap / Math.min(wa.length, wb.length) >= 0.6;
 }
 
+/** Small-model filler: asking about the other person's day instead of replying. */
+const SMALL_TALK_PATTERNS = [
+  /how('s| is| are| was| were)\s+(your|ya|u|you)\s+(day|weekend|night|evening|morning)/i,
+  /how('s| is)\s+it\s+going/i,
+  /how\s+are\s+(you|ya|u)(\s+doing)?/i,
+  /what('s| is)\s+(up|new)(\s+with)?\s+(you|ya|u|yourself)/i,
+  /what\s+have\s+(you|ya|u)\s+been\s+up\s+to/i,
+  /(how|what)\s+about\s+(you|ya|u|yourself)/i,
+  /how('s| is)\s+your\s+day(\s+going)?/i,
+];
+
+export function isSmallTalkFiller(text) {
+  return SMALL_TALK_PATTERNS.some((re) => re.test(text.toLowerCase()));
+}
+
 /** Hard cap: cut long replies down to short, complete sentences. */
 export function shortenReply(text, maxChars = config.replyMaxChars) {
   const trimmed = text.trim();
@@ -219,6 +234,20 @@ export async function ask(convoKey, userText, signal, speakerName, insulted = fa
         // Note: deliberately does NOT name the word — naming it makes the model
         // parrot it back.
         { role: 'system', content: 'You keep repeating the same topic. Change the subject completely and say something new.' },
+      ],
+      { signal },
+    );
+    if (nudged) reply = nudged;
+  }
+
+  // Anti-small-talk: the model falls back to "how's your day?" when it has
+  // nothing to say. If the reply is mostly that, regenerate it.
+  if (isSmallTalkFiller(reply)) {
+    console.log('[llm] small-talk filler — regenerating');
+    const nudged = await chat(
+      [
+        ...context,
+        { role: 'system', content: 'Do not ask the other person about their day, weekend, or what they have been up to. Respond directly to what was said instead.' },
       ],
       { signal },
     );
