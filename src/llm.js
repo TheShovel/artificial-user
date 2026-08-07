@@ -50,10 +50,12 @@ async function chat(messages, { signal, temperature, numCtx, think = false, maxT
 
       const data = await response.json();
       let reply = stripThinkBlocks(data.message?.content ?? '').trim();
-      // Strip emojis, bracket artifacts, and stray HTML tags (small models
-      // leak "<br>" and "[Name]:" formatting), but never let it erase the
-      // reply entirely (small models sometimes emit only "[Alex]" or an emoji).
-      const stripped = stripEmojis(stripBrackets(stripHtml(reply)));
+      // Strip emojis, bracket artifacts, stray HTML tags, and hashtags (small
+      // models leak "<br>", "[Name]:" and "#whatsup" formatting), but never
+      // let it erase the reply entirely.
+      const stripped = stripEmojis(stripBrackets(stripHtml(reply)))
+        .replace(/#\w+/g, ' ')
+        .replace(/\s+/g, ' ');
       reply = stripped || stripEmojis(reply);
       // Drop leading punctuation left over from the model imitating "[Name]:".
       reply = reply.replace(/^[\s:;,]*/, '').trim();
@@ -242,6 +244,7 @@ const STOPWORDS = new Set([
   'much','many','more','most','other','another','still','even','well','good','bad',
   'something','someone','somebody','anything','anyone','nothing','everything','everyone',
   'somewhere','anywhere','watch','watching','wanna','gonna','maybe','sure','yeah',
+  'jody','jodi','jodie','jodiiee', // name misspellings the model fixates on
 ]);
 
 /** Distinctive words (>3 chars, not stopwords) in a reply. */

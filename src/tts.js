@@ -6,10 +6,31 @@ const require = createRequire(import.meta.url);
 
 // meSpeak: eSpeak compiled to JavaScript. Robotic, but fully local and
 // dependency-free. (GPL — see mespeak package for details.)
-const mespeak = require('mespeak');
+let mespeak = require('mespeak');
 mespeak.loadConfig(require('mespeak/src/mespeak_config.json'));
 mespeak.loadVoice(require('mespeak/voices/en/en-us.json'));
 mespeak.setDefaultVoice('en/en-us');
+
+// eSpeak's WASM heap corrupts after many calls (the known "~80th call" bug),
+// which makes it throw RangeErrors mid-synthesis. Reloading the whole mespeak
+// module gives a fresh engine, so we do that periodically and after failures.
+let speakCalls = 0;
+const REBUILD_EVERY = 40;
+
+function rebuildEngine() {
+  try {
+    const espeakPath = require.resolve('mespeak/src/ESpeak.js');
+    const indexPath = require.resolve('mespeak');
+    delete require.cache[espeakPath];
+    delete require.cache[indexPath];
+    mespeak = require('mespeak');
+    mespeak.loadConfig(require('mespeak/src/mespeak_config.json'));
+    mespeak.loadVoice(require('mespeak/voices/en/en-us.json'));
+    mespeak.setDefaultVoice('en/en-us');
+  } catch (error) {
+    console.error('[tts] engine rebuild failed:', error.message);
+  }
+}
 
 // Words a robotic voice would mangle if read literally; expanded first.
 // (The model occasionally still emits these.)
@@ -74,11 +95,30 @@ function truncateForSpeech(text) {
 export function synthesize(text) {
   const phrase = truncateForSpeech(expandTextisms(cleanForSpeech(text)));
   if (!phrase) return null;
-  const wav = mespeak.speak(phrase, {
-    rawdata: 'buffer',
-    speed: config.ttsSpeed,
-    pitch: config.ttsPitch,
-    variant: config.ttsVariant,
-  });
-  return wav?.length ? wav : null;
+
+  const trySpeak = () =>
+    mespeak.speak(phrase, {
+      rawdata: 'buffer',
+      speed: config.ttsSpeed,
+      pitch: config.ttsPitch,
+      variant: config.ttsVariant,
+    });
+
+  try {
+    if (++speakCalls % REBUILD_EVERY === 0) rebuildEngine(); // prevent corruption
+    const wav = trySpeak();
+    if (wav?.length) return wav;
+  } catch (error) {
+    console.error('[tts] synthesis failed, rebuilding engine:', error.message);
+  }
+
+  // Retry once after rebuilding the engine (self-heals the ~80th-call bug).
+  rebuildEngine();
+  try {
+    const wav = trySpeak();
+    if (wav?.length) return wav;
+  } catch (error) {
+    console.error('[tts] synthesis failed after rebuild:', error.message);
+  }
+  return null;
 }
