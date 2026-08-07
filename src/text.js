@@ -20,9 +20,10 @@ export function stripHtml(text) {
 }
 
 /**
- * Detects whisper stutter-loops: transcripts where one word makes up most of
- * the clip ("I-I-I-I-I...", "bro bro bro bro..."). Real speech doesn't do
- * this; audio that slips past the VAD often does.
+ * Detects whisper stutter-loops: transcripts where one word or short phrase
+ * makes up most of the clip ("I-I-I-I...", "I'm so sorry I'm so sorry...",
+ * "bro bro bro..."). Real speech doesn't do this; audio that slips past the
+ * VAD often does.
  */
 export function isRepetitiveGarbage(text) {
   const flat = text.toLowerCase().replace(/[^a-z\s]/g, ' ');
@@ -37,6 +38,18 @@ export function isRepetitiveGarbage(text) {
 
   // One character repeated in a row ("aaaaaaa").
   if (/([a-z])\1{9,}/.test(flat)) return true;
+
+  // The same 2-3 word phrase repeated many times ("i'm so sorry" x80).
+  // Catches loops where no single word dominates.
+  for (const size of [2, 3]) {
+    if (words.length < size * 4) continue;
+    const phrases = new Map();
+    for (let i = 0; i + size <= words.length; i++) {
+      const key = words.slice(i, i + size).join(' ');
+      phrases.set(key, (phrases.get(key) ?? 0) + 1);
+    }
+    if (Math.max(...phrases.values()) >= 4) return true;
+  }
 
   return false;
 }

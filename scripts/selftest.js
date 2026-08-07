@@ -147,8 +147,10 @@ const { isRepetitiveGarbage, mentionsBotName } = await import('../src/text.js');
 const garbageTests = [
   ['I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-I-', true],
   ['bro bro bro bro bro bro bro', true],
+  ['i\'m so sorry, '.repeat(80), true],
   ['hey bobby what do you think', false],
   ['yeah yeah yeah yeah sure', false],
+  ["i'm so sorry i'm so sorry i'm so sorry i can't believe it", false],
 ];
 for (const [input, expected] of garbageTests) {
   const got = isRepetitiveGarbage(input);
