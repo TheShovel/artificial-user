@@ -110,6 +110,8 @@ const SMALL_TALK_PATTERNS = [
   /what\s+have\s+(you|ya|u)\s+been\s+up\s+to/i,
   /(how|what)\s+about\s+(you|ya|u|yourself)/i,
   /how('s| is)\s+your\s+day(\s+going)?/i,
+  /what('s|s| is)?\s+(next|now|else)\b/i,
+  /anything\s+else/i,
 ];
 
 export function isSmallTalkFiller(text) {
