@@ -82,7 +82,7 @@ console.log(`\n=== TTS → STT round trip (phrase: "${PHRASE}") ===\n`);
 
 let wav;
 try {
-  wav = synthesize(PHRASE);
+  wav = await synthesize(PHRASE);
   record('tts.synthesize produces a WAV', wav && wav.length > 1000, `${wav?.length ?? 0} bytes`);
 } catch (error) {
   record('tts.synthesize produces a WAV', false, error.message);
@@ -173,6 +173,25 @@ const nameTests = [
 for (const [input, expected] of nameTests) {
   const got = mentionsBotName(input);
   record(`mentionsBotName(${JSON.stringify(input)}) = ${expected}`, got === expected, `got ${got}`);
+}
+
+console.log(`\n=== Reply cleanup ===\n`);
+
+const { stripTrailingQuestions } = await import('../src/llm.js');
+const questionTests = [
+  ['I like pizza. What about you?', 'I like pizza.'],
+  ['That was crazy! What do you think? Huh?', 'That was crazy!'],
+  ['Yeah, I agree.', 'Yeah, I agree.'],
+  ['What do you think?', 'What do you think?'], // single-question replies get regenerated in ask(), not stripped
+  ['Sure thing, man.', 'Sure thing, man.'],
+];
+for (const [input, expected] of questionTests) {
+  const got = stripTrailingQuestions(input);
+  record(
+    `stripTrailingQuestions(${JSON.stringify(input)}) = ${JSON.stringify(expected)}`,
+    got.text === expected,
+    `got ${JSON.stringify(got)}`,
+  );
 }
 
 console.log(`\n=== Ollama (${config.llmModel}) ===\n`);

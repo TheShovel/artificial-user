@@ -16,6 +16,11 @@ into the flow of conversation on its own, just not constantly.
 **It remembers.** Facts people mention stick around, compressed as the
 conversation grows. `/forget` wipes it clean.
 
+**Multiple servers.** It can hang out in several servers at the same time.
+Each server gets its own conversation memory, its own `/say` cooldown, and
+its own voice connection. Work is spread across worker threads so one busy
+server doesn't make it go quiet in another.
+
 ## Requirements
 
 - Node.js 20 or newer
@@ -49,7 +54,7 @@ ready.
 |---|---|
 | `/join` | Joins your voice channel and starts listening |
 | `/leave` | Leaves and stops listening |
-| `/say text` | Makes it say something out loud. It remembers having said it. Has a 30 second cooldown. |
+| `/say text` | Makes it say something out loud. It remembers having said it. Has a 30 second cooldown per server. |
 | `/forget` | Clears its memory for this server |
 | `/status` | Shows connection state, memory size, and which model it uses |
 
@@ -63,14 +68,18 @@ you speak -> captured audio -> tiny Whisper checks if it's for Bobby (~0.4s)
                               -> eSpeak says it out loud
 ```
 
+Each stage runs off the main thread so one server's load doesn't stall
+another: transcription runs in dedicated Whisper workers, speech synthesis in
+its own worker, and every server gets its own turn queue.
+
 A few details worth knowing:
 
 - **Hearing.** Silero VAD filters out music, clicks, and game audio before
   Whisper ever runs, so it doesn't hallucinate words from noise. Whisper-tiny
   does fast detection, and whisper-base only runs when a reply is coming.
 - **Thinking.** Replies are capped to a couple of short sentences. The model
-  can't loop on phrases (repeat penalty), won't repeat itself, and gets
-  nudged if it fixates on one topic.
+  can't loop on phrases (repeat penalty), won't repeat itself, gets nudged if
+  it fixates on one topic, and never ends a reply on a question.
 - **Memory.** The last 6 messages stay raw. Older ones get compressed into
   short fact lines and keywords. It only remembers what people said, not its
   own rambling. Saved to `data/memory.json`, so it survives restarts.
@@ -88,6 +97,8 @@ knobs:
 - `CONTINUATION_WINDOW_MS` (how long after speaking it stays in the flow)
 - `LLM_MODEL` (swap to a bigger or smaller model anytime)
 - `STT_MODEL` (transcription accuracy vs speed)
+- `STT_MAIN_WORKERS` (how many quality transcription workers; raise it when
+  the bot is in several servers at once)
 - `SYSTEM_PROMPT` (rewrite its whole personality)
 
 ## Sanity check

@@ -2,71 +2,135 @@ import { Worker } from 'node:worker_threads';
 import { config } from './config.js';
 
 /**
- * Whisper transcription, run in a pool of worker threads so inference never
- * blocks the bot's event loop (it would otherwise freeze for ~3 s per
- * utterance, stutter playback, and pile up when several people talk at once).
- * Each worker serializes its own jobs; the pool lets multiple speakers
- * transcribe in parallel on multi-core machines.
+ * Speech-to-text runs in two dedicated worker pools so inference never blocks
+ * the bot and servers don't starve each other:
+ *
+ *   fast — whisper-tiny.en, the wake-word detector. EVERY utterance hits this
+ *          pass, so it gets its own workers and is never queued behind slow
+ *          quality transcriptions from another server.
+ *   main — whisper-base, the quality pass that only runs when Bobby is about
+ *          to answer. Multiple workers let several servers (or speakers)
+ *          transcribe at the same time.
+ *
+ * Each worker loads only its own model, so a pool of N costs ~N × one model
+ * in memory instead of N × both models.
+ *
+ * Dispatch picks the worker with the fewest jobs in flight; ties go to the
+ * most recently used worker (warm CPU cache), so a single server keeps hitting
+ * the same worker while several servers spread across the pool.
  */
 
-let workers = [];
-let readyPromise = null;
+const pools = {
+  fast: createPool('fast', Math.max(1, config.sttFastWorkers)),
+  main: createPool('main', Math.max(1, config.sttMainWorkers)),
+};
+
 let nextId = 1;
-let dispatch = 0; // round-robin across the pool
-const pending = new Map(); // job id -> { resolve, reject }
+const pending = new Map(); // job id -> { resolve, reject, pool, entry }
 
-/** Spawn the STT worker pool and wait for the models to load. Cached. */
-export function initStt() {
-  if (workers.length > 0) return readyPromise;
+function createPool(role, size) {
+  const pool = {
+    role,
+    entries: [], // { worker, inFlight, lastUse }
+    readyPromise: null,
+    resolveReady: null, // resolves the current readyPromise (unblocks waiters if the pool dies)
+  };
 
-  const poolSize = Math.max(1, config.sttWorkers);
-  readyPromise = new Promise((resolve, reject) => {
-    let ready = 0;
-    for (let i = 0; i < poolSize; i++) {
-      // Bound ONNX threads per worker: onnxruntime's default (all cores) thrashes
-      // the cache and runs *slower*; poolSize x sttThreads uses the machine well.
-      const worker = new Worker(new URL('./stt-worker.js', import.meta.url), {
-        execArgv: [],
-        env: { ...process.env, OMP_NUM_THREADS: String(config.sttThreads) },
-      });
+  const ensure = () => {
+    if (pool.readyPromise) return pool.readyPromise;
+    pool.readyPromise = new Promise((resolve) => {
+      pool.resolveReady = resolve;
+      let ready = 0;
+      const spawn = () => {
+        const entry = {
+          worker: new Worker(new URL('./stt-worker.js', import.meta.url), {
+            // Bound ONNX threads per worker: onnxruntime's default (all cores)
+            // thrashes the cache and runs *slower*; workers × sttThreads uses
+            // the machine well. The role picks which model the worker loads.
+            env: {
+              ...process.env,
+              OMP_NUM_THREADS: String(config.sttThreads),
+              STT_WORKER_ROLE: role,
+            },
+          }),
+          inFlight: 0,
+          lastUse: 0,
+        };
 
-      worker.on('message', (message) => {
-        if (message.type === 'ready') {
-          ready++;
-          if (ready === poolSize) {
-            console.log(`[stt] ready (${poolSize} worker${poolSize > 1 ? 's' : ''})`);
-            resolve();
+        entry.worker.on('message', (message) => {
+          if (message.type === 'ready') {
+            ready++;
+            if (ready === size) {
+              console.log(`[stt] ${role} pool ready (${size} worker${size > 1 ? 's' : ''})`);
+              resolve();
+            }
+            return;
           }
-          return;
-        }
-        const job = pending.get(message.id);
-        if (!job) return;
-        pending.delete(message.id);
-        if (message.error) job.reject(new Error(message.error));
-        else job.resolve({ text: message.text ?? '', wake: message.wake ?? false });
-      });
+          const job = pending.get(message.id);
+          if (!job || job.pool !== pool) return;
+          pending.delete(message.id);
+          entry.inFlight = Math.max(0, entry.inFlight - 1);
+          if (message.error) job.reject(new Error(message.error));
+          else job.resolve({ text: message.text ?? '', wake: message.wake ?? false });
+        });
 
-      worker.on('error', (error) => {
-        console.error('[stt] worker error:', error.message);
-      });
+        entry.worker.on('error', (error) => {
+          console.error(`[stt:${role}] worker error:`, error.message);
+        });
 
-      worker.on('exit', (code) => {
-        console.error(`[stt] worker exited (code ${code}) — restarting on next use`);
-        for (const job of pending.values()) job.reject(new Error('STT worker exited'));
-        pending.clear();
-        workers = [];
-        readyPromise = null;
-      });
+        entry.worker.on('exit', (code) => {
+          console.error(`[stt:${role}] worker exited (code ${code})`);
+          const idx = pool.entries.indexOf(entry);
+          if (idx !== -1) pool.entries.splice(idx, 1);
+          // Only jobs that were on the dead worker fail; everything else carries on.
+          for (const job of [...pending.values()]) {
+            if (job.pool === pool && job.entry === entry) {
+              pending.delete(job.id);
+              job.reject(new Error('STT worker exited'));
+            }
+          }
+          if (pool.entries.length === 0) {
+            // Whole pool is down. Unblock anyone waiting on it — their next
+            // utterance rebuilds the pool from scratch.
+            pool.readyPromise = null;
+            pool.resolveReady?.();
+            pool.resolveReady = null;
+          } else {
+            spawn(); // keep the pool at its configured size
+          }
+        });
 
-      workers.push(worker);
+        pool.entries.push(entry);
+      };
+      for (let i = 0; i < size; i++) spawn();
+    });
+    return pool.readyPromise;
+  };
+  pool.ensure = ensure;
+  return pool;
+}
+
+/** Worker with the fewest in-flight jobs; ties go to the warmest cache. */
+function pick(pool) {
+  let best = null;
+  for (const entry of pool.entries) {
+    if (!best || entry.inFlight < best.inFlight) {
+      best = entry;
+    } else if (entry.inFlight === best.inFlight && entry.lastUse > best.lastUse) {
+      best = entry;
     }
-  });
-  return readyPromise;
+  }
+  return best;
+}
+
+/** Spawn both pools and wait for their models to load. Cached. */
+export async function initStt() {
+  await Promise.all([pools.fast.ensure(), pools.main.ensure()]);
 }
 
 /** Transcribe a 16 kHz mono 16-bit PCM buffer to text (or '' if nothing heard). */
 export async function transcribe(pcm16kMono) {
-  return (await runJob(pcm16kMono, 'main')).text;
+  return (await runJob(pcm16kMono, pools.main)).text;
 }
 
 /**
@@ -74,22 +138,27 @@ export async function transcribe(pcm16kMono) {
  * `wake` is whether the transcript mentions the bot's name.
  */
 export async function transcribeFast(pcm16kMono) {
-  return runJob(pcm16kMono, 'fast');
+  return runJob(pcm16kMono, pools.fast);
 }
 
-async function runJob(pcm16kMono, model) {
-  await initStt(); // ensures the pool is up; no-op once loaded
+async function runJob(pcm16kMono, pool) {
+  await pool.ensure(); // no-op if already up; rebuilds if the pool died
+
+  const entry = pick(pool);
+  if (!entry) throw new Error('STT pool unavailable — try again');
 
   const id = nextId++;
-  const job = new Promise((resolve, reject) => pending.set(id, { resolve, reject }));
-  const worker = workers[dispatch % workers.length];
-  dispatch++;
+  entry.inFlight++;
+  entry.lastUse = Date.now();
+  const job = new Promise((resolve, reject) =>
+    pending.set(id, { resolve, reject, pool, entry }),
+  );
 
   const buffer = pcm16kMono.buffer.slice(
     pcm16kMono.byteOffset,
     pcm16kMono.byteOffset + pcm16kMono.byteLength,
   );
-  worker.postMessage({ type: 'transcribe', model, id, buffer }, [buffer]);
+  entry.worker.postMessage({ type: 'transcribe', id, buffer }, [buffer]);
   return job; // { text, wake }
 }
 

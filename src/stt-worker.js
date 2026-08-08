@@ -9,13 +9,18 @@ import { isRepetitiveGarbage, mentionsBotName } from './text.js';
 // transcribing. Jobs are processed one at a time (serialized), which also
 // keeps many-people-talking-at-once from thrashing the CPU.
 //
+// This worker handles ONE role, chosen by the parent process:
+//   "fast" -> whisper-tiny.en, the wake-word detector (every utterance)
+//   "main" -> whisper-base, the quality pass (only for actual replies)
+// Splitting the models across dedicated pools means a slow quality pass on
+// one server never delays wake-word detection on another, and each worker
+// only loads the one model it needs.
+//
 // Before Whisper, a Silero VAD pass rejects non-speech (music, game audio,
 // keyboard noise) in milliseconds — Whisper is only run on actual speech.
-//
-// Speed design: the main model is whisper-base (~2.5x faster than small).
-// Whisper-base occasionally muffles the wake word, so when the fast pass
-// finds no wake word, a whisper-tiny.en pass double-checks — tiny.en is fast
-// AND hears "bobby" in cases base misses. Worst case ~1s, common case ~0.7s.
+
+const ROLE = process.env.STT_WORKER_ROLE ?? 'main';
+const MODEL_ID = ROLE === 'fast' ? config.sttFallbackModel : config.sttModel;
 
 function pcmToFloat32(buffer) {
   const samples = new Float32Array(buffer.length / 2);
@@ -25,23 +30,26 @@ function pcmToFloat32(buffer) {
   return samples;
 }
 
-const transcriberCache = new Map(); // model id -> promise
-function getTranscriber(modelId, dtype) {
-  if (!transcriberCache.has(modelId)) {
-    console.log(`[stt-worker] loading "${modelId}" (dtype: ${dtype})...`);
-    transcriberCache.set(
-      modelId,
-      pipeline('automatic-speech-recognition', modelId, { dtype }),
-    );
+let transcriberPromise = null;
+function getTranscriber() {
+  if (!transcriberPromise) {
+    console.log(`[stt-worker:${ROLE}] loading "${MODEL_ID}" (dtype: ${config.sttDtype})...`);
+    transcriberPromise = pipeline('automatic-speech-recognition', MODEL_ID, {
+      dtype: config.sttDtype,
+    }).catch((error) => {
+      // Allow a later job to retry (e.g. after a download failure).
+      transcriberPromise = null;
+      throw error;
+    });
   }
-  return transcriberCache.get(modelId);
+  return transcriberPromise;
 }
 
-async function transcribeWith(modelId, transcriber, buffer) {
+async function transcribeWith(transcriber, buffer) {
   const audio = pcmToFloat32(buffer);
   const options = { chunk_length_s: 30, stride_length_s: 5 };
   // English-only models (.en) reject a language hint.
-  if (config.sttLanguage && !modelId.toLowerCase().includes('.en')) {
+  if (config.sttLanguage && !MODEL_ID.toLowerCase().includes('.en')) {
     options.language = config.sttLanguage;
   }
   const output = await transcriber(audio, options);
@@ -51,12 +59,18 @@ async function transcribeWith(modelId, transcriber, buffer) {
 let vadSessionPromise = null;
 function getVad() {
   if (!vadSessionPromise) {
-    vadSessionPromise = ensureVadModel().then((modelPath) =>
-      ort.InferenceSession.create(modelPath, {
-        executionProviders: ['cpu'],
-        graphOptimizationLevel: 'all',
-      }),
-    );
+    vadSessionPromise = ensureVadModel()
+      .then((modelPath) =>
+        ort.InferenceSession.create(modelPath, {
+          executionProviders: ['cpu'],
+          graphOptimizationLevel: 'all',
+        }),
+      )
+      .catch((error) => {
+        // Allow a later job to retry (e.g. after a download failure).
+        vadSessionPromise = null;
+        throw error;
+      });
   }
   return vadSessionPromise;
 }
@@ -72,20 +86,17 @@ async function handleTranscribe(message) {
       return;
     }
 
-    if (message.model === 'fast') {
-      // Detection pass: whisper-tiny.en (~0.3 s) is fast AND hears the wake
-      // word more reliably than bigger models. Returns whether it was hit.
-      const fast = await getTranscriber(config.sttFallbackModel, config.sttDtype);
-      let text = await transcribeWith(config.sttFallbackModel, fast, buffer);
-      // Whisper sometimes locks onto a syllable ("I-I-I-I-I..."); that's not
-      // speech worth acting on.
-      if (isRepetitiveGarbage(text)) text = '';
+    const transcriber = await getTranscriber();
+    let text = await transcribeWith(transcriber, buffer);
+    // Whisper sometimes locks onto a syllable ("I-I-I-I-I..."); that's not
+    // speech worth acting on.
+    if (isRepetitiveGarbage(text)) text = '';
+
+    if (ROLE === 'fast') {
+      // The detection pass also reports whether the bot's name was said.
       parentPort.postMessage({ id: message.id, text, wake: mentionsBotName(text) });
     } else {
       // Full-quality pass (whisper-base) for actual responses.
-      const main = await getTranscriber(config.sttModel, config.sttDtype);
-      let text = await transcribeWith(config.sttModel, main, buffer);
-      if (isRepetitiveGarbage(text)) text = '';
       parentPort.postMessage({ id: message.id, text });
     }
   } catch (error) {
@@ -149,13 +160,15 @@ parentPort.on('message', (message) => {
   chain = chain.then(() => handleTranscribe(message));
 });
 
-// Load the VAD + model at startup so the first utterance doesn't wait.
+// Load the VAD + this worker's model at startup so the first utterance
+// doesn't wait for a download or a cold model load.
 getVad()
+  .then(() => getTranscriber())
   .then(() => {
     parentPort.postMessage({ type: 'ready' });
-    console.log('[stt-worker] model + VAD ready');
+    console.log(`[stt-worker:${ROLE}] model + VAD ready`);
   })
   .catch((error) => {
-    console.error('[stt-worker] startup failed:', error.message);
-    parentPort.postMessage({ type: 'ready' }); // still come up; VAD will be retried per job
+    console.error(`[stt-worker:${ROLE}] startup failed:`, error.message);
+    parentPort.postMessage({ type: 'ready' }); // still come up; models retried per job
   });

@@ -79,6 +79,7 @@ export class VoiceBot {
       lastSpokeAt: 0, // when the bot last spoke (conversation-continuation gate)
       lastWasQuestion: false, // did the bot's last reply ask a question?
       lastUnnamedResponseAt: 0, // throttle for unnamed responses
+      lastSayAt: 0, // /say cooldown, tracked per server so one server can't block another
     };
     this.guilds.set(state.guildId, state);
     this.#setupListeners(state);
@@ -297,7 +298,7 @@ export class VoiceBot {
   async playText(state, text) {
     let wav;
     try {
-      wav = synthesize(text);
+      wav = await synthesize(text);
     } catch (error) {
       console.error('[tts]', error);
       return;

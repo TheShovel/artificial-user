@@ -46,7 +46,7 @@ const models = process.argv[2]?.split(',') ?? [
 ];
 
 const audio = {};
-for (const [name, phrase] of Object.entries(phrases)) audio[name] = await wavToPcm16(synthesize(phrase));
+for (const [name, phrase] of Object.entries(phrases)) audio[name] = await wavToPcm16(await synthesize(phrase));
 
 for (const spec of models) {
   const [id, dtype] = spec.split(':');

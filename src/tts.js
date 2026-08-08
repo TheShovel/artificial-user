@@ -1,35 +1,43 @@
-import { createRequire } from 'node:module';
+import { Worker } from 'node:worker_threads';
 import { config } from './config.js';
 import { stripEmojis, stripHtml } from './text.js';
 
-const require = createRequire(import.meta.url);
+// Text-to-speech runs in a worker thread: eSpeak synthesis is synchronous and
+// can take a few hundred ms, which would otherwise freeze the bot's event loop
+// (and with it, audio capture in every server it is connected to). The worker
+// owns the mespeak engine and its periodic rebuild, and returns WAV buffers.
 
-// meSpeak: eSpeak compiled to JavaScript. Robotic, but fully local and
-// dependency-free. (GPL — see mespeak package for details.)
-let mespeak = require('mespeak');
-mespeak.loadConfig(require('mespeak/src/mespeak_config.json'));
-mespeak.loadVoice(require('mespeak/voices/en/en-us.json'));
-mespeak.setDefaultVoice('en/en-us');
+let ttsWorker = null;
+let ttsReady = null;
+let ttsResolveReady = null;
+let nextId = 1;
+const pending = new Map(); // job id -> resolve
 
-// eSpeak's WASM heap corrupts after many calls (the known "~80th call" bug),
-// which makes it throw RangeErrors mid-synthesis. Reloading the whole mespeak
-// module gives a fresh engine, so we do that periodically and after failures.
-let speakCalls = 0;
-const REBUILD_EVERY = 40;
-
-function rebuildEngine() {
-  try {
-    const espeakPath = require.resolve('mespeak/src/ESpeak.js');
-    const indexPath = require.resolve('mespeak');
-    delete require.cache[espeakPath];
-    delete require.cache[indexPath];
-    mespeak = require('mespeak');
-    mespeak.loadConfig(require('mespeak/src/mespeak_config.json'));
-    mespeak.loadVoice(require('mespeak/voices/en/en-us.json'));
-    mespeak.setDefaultVoice('en/en-us');
-  } catch (error) {
-    console.error('[tts] engine rebuild failed:', error.message);
-  }
+function getWorker() {
+  if (ttsWorker) return ttsReady;
+  ttsReady = new Promise((resolve) => {
+    ttsResolveReady = resolve;
+  });
+  ttsWorker = new Worker(new URL('./tts-worker.js', import.meta.url));
+  ttsWorker.on('message', (message) => {
+    if (message.type === 'ready') {
+      ttsResolveReady?.();
+      return;
+    }
+    const resolve = pending.get(message.id);
+    if (!resolve) return;
+    pending.delete(message.id);
+    resolve(message.wav ?? null);
+  });
+  ttsWorker.on('error', (error) => console.error('[tts] worker error:', error.message));
+  ttsWorker.on('exit', (code) => {
+    console.error(`[tts] worker exited (code ${code}) — restarting on next use`);
+    for (const resolve of pending.values()) resolve(null);
+    pending.clear();
+    ttsWorker = null;
+    ttsReady = null;
+  });
+  return ttsReady;
 }
 
 // Words a robotic voice would mangle if read literally; expanded first.
@@ -91,34 +99,32 @@ function truncateForSpeech(text) {
   return text.slice(0, end);
 }
 
-/** Synthesize text and return a WAV file as a Buffer (22.05 kHz mono PCM). */
-export function synthesize(text) {
+/**
+ * Synthesize text and return a Promise<Buffer|null> for the WAV file
+ * (22.05 kHz mono PCM). Runs in the TTS worker so the event loop stays
+ * responsive even when several servers are talking at once.
+ */
+export async function synthesize(text) {
   const phrase = truncateForSpeech(expandTextisms(cleanForSpeech(text)));
   if (!phrase) return null;
 
-  const trySpeak = () =>
-    mespeak.speak(phrase, {
-      rawdata: 'buffer',
-      speed: config.ttsSpeed,
-      pitch: config.ttsPitch,
-      variant: config.ttsVariant,
-    });
-
   try {
-    if (++speakCalls % REBUILD_EVERY === 0) rebuildEngine(); // prevent corruption
-    const wav = trySpeak();
-    if (wav?.length) return wav;
-  } catch (error) {
-    console.error('[tts] synthesis failed, rebuilding engine:', error.message);
+    await getWorker();
+  } catch {
+    return null;
   }
+  const worker = ttsWorker;
+  if (!worker) return null; // died between await and post
 
-  // Retry once after rebuilding the engine (self-heals the ~80th-call bug).
-  rebuildEngine();
-  try {
-    const wav = trySpeak();
-    if (wav?.length) return wav;
-  } catch (error) {
-    console.error('[tts] synthesis failed after rebuild:', error.message);
-  }
-  return null;
+  const id = nextId++;
+  const wavPromise = new Promise((resolve) => pending.set(id, resolve));
+  worker.postMessage({
+    type: 'synthesize',
+    id,
+    text: phrase,
+    speed: config.ttsSpeed,
+    pitch: config.ttsPitch,
+    variant: config.ttsVariant,
+  });
+  return wavPromise;
 }

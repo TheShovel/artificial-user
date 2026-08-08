@@ -118,6 +118,26 @@ export function isSmallTalkFiller(text) {
   return SMALL_TALK_PATTERNS.some((re) => re.test(text.toLowerCase()));
 }
 
+/**
+ * Cut trailing question sentences from a reply. Small models love ending on
+ * "what do you think?" even when told not to, so this is enforced
+ * deterministically. Returns { text, stripped }: `text` is the reply without
+ * the trailing questions (or the original when the last sentence was already
+ * a statement), and `stripped` says whether anything was cut.
+ */
+export function stripTrailingQuestions(text) {
+  const trimmed = text.trim();
+  const sentences = trimmed.match(/[^.!?]*[.!?]+(?:\s|$)/g) ?? [];
+  if (sentences.length < 2) return { text: trimmed, stripped: false };
+
+  let end = sentences.length;
+  while (end > 1 && /[?？]\s*$/.test(sentences[end - 1].trim())) end--;
+  if (end === sentences.length) return { text: trimmed, stripped: false };
+
+  const rest = sentences.slice(0, end).join('').trim();
+  return { text: rest, stripped: true };
+}
+
 /** Hard cap: cut long replies down to short, complete sentences. */
 export function shortenReply(text, maxChars = config.replyMaxChars) {
   const trimmed = text.trim();
@@ -240,6 +260,25 @@ export async function ask(convoKey, userText, signal, speakerName, insulted = fa
       { signal },
     );
     if (nudged) reply = nudged;
+  }
+
+  // Anti-trailing-question: small models love ending every reply on a
+  // question ("what do you think?") even when told not to. Cut it
+  // deterministically; if the whole reply was questions, regenerate it.
+  const stripped = stripTrailingQuestions(reply);
+  const stillQuestion = /[?？]\s*$/.test(stripped.text);
+  if (stripped.stripped && !stillQuestion) {
+    reply = stripped.text;
+  } else if (stillQuestion) {
+    console.log('[llm] reply was only a question — regenerating');
+    const nudged = await chat(
+      [
+        ...context,
+        { role: 'system', content: 'Answer with a statement. Do not end your reply with a question.' },
+      ],
+      { signal },
+    );
+    if (nudged) reply = stripTrailingQuestions(nudged).text || nudged;
   }
 
   // Anti-small-talk: the model falls back to "how's your day?" when it has

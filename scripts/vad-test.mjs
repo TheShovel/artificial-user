@@ -42,7 +42,7 @@ function summarize(name, probs) {
 }
 
 // 1) Real speech via mespeak -> 16k mono PCM
-const wav = synthesize('hey bobby what do you think about this');
+const wav = await synthesize('hey bobby what do you think about this');
 const r = spawnSync('ffmpeg', [
   '-loglevel', 'error', '-i', 'pipe:0',
   '-f', 's16le', '-ar', '16000', '-ac', '1', 'pipe:1',

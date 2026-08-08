@@ -26,8 +26,6 @@ const client = new Client({
 
 const voiceBot = new VoiceBot(client);
 
-let lastSayAt = 0; // global /say cooldown tracker
-
 const commands = [
   new SlashCommandBuilder()
     .setName('join')
@@ -104,15 +102,15 @@ client.on('interactionCreate', async (interaction) => {
     if (!state) {
       return interaction.reply({ content: 'I\'m not in a voice channel. Use /join first.', flags: MessageFlags.Ephemeral });
     }
-    // Global cooldown on /say.
-    const remaining = config.sayCooldownMs - (Date.now() - lastSayAt);
+    // Cooldown on /say, per server (one server can't block another).
+    const remaining = config.sayCooldownMs - (Date.now() - state.lastSayAt);
     if (remaining > 0) {
       return interaction.reply({
         content: `/say is on cooldown — try again in ${Math.ceil(remaining / 1000)}s.`,
         flags: MessageFlags.Ephemeral,
       });
     }
-    lastSayAt = Date.now();
+    state.lastSayAt = Date.now();
 
     const text = interaction.options.getString('text', true);
     // Store it as the bot's own message so it "remembers" having said it.

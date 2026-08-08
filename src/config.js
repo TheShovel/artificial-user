@@ -19,7 +19,7 @@ const DEFAULT_SYSTEM_PROMPT = [
   'You are a regular person hanging out in a Discord voice channel with your friends.',
   'You are NOT an assistant, chatbot, or helper — you are just a buddy in the call.',
   'Chat naturally and casually the way people actually talk: use contractions, be relaxed,',
-  'banter, tease, joke, react to what people say, and ask questions back.',
+  'banter, tease, joke, and react to what people say.',
   'Never offer to help, never give formal or structured answers, never say "as an AI",',
   'and never be polite in a customer-service way.',
   'Keep replies VERY short: one or two short sentences, under 15 words total,',
@@ -30,6 +30,7 @@ const DEFAULT_SYSTEM_PROMPT = [
   'If you are not sure what to say, a short simple reply is better than changing the subject.',
   'Never ask generic small-talk questions like "how is your day?", "what have you',
   'been up to?", "what about you?", or "what\'s next?". Just respond to what people say.',
+  'Never end your reply with a question. Answer with a statement instead.',
   'Use plain text only: no markdown, no emojis, no lists.',
   'People address you by name, so expect to be talked to directly.',
   'Remember what was said earlier in the conversation and reference it like a friend would',
@@ -65,7 +66,8 @@ export const config = {
   sttFallbackModel: process.env.STT_FALLBACK_MODEL || 'onnx-community/whisper-tiny.en',
   sttDtype: process.env.STT_DTYPE || 'q8',
   sttLanguage: process.env.STT_LANGUAGE || undefined,
-  sttWorkers: num(process.env.STT_WORKERS, 1), // parallel transcription workers (measured: 1 is fastest here)
+  sttFastWorkers: num(process.env.STT_FAST_WORKERS, 1), // wake-word (tiny.en) workers — always snappy
+  sttMainWorkers: num(process.env.STT_MAIN_WORKERS, 1), // quality (base) workers — raise for several servers
   sttThreads: num(process.env.STT_THREADS, 4), // ONNX threads per worker (4 beats the default 12)
 
   // Text-to-speech (local, robotic but dependency-free)
